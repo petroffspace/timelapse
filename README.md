@@ -1,6 +1,3 @@
-## `README.md`
-
-```markdown
 # Time Lapse Studio
 
 A web-based application that transforms videos into motion-blur time lapses using cumulative frame blending. Upload any video, select a blend mode, and generate a stylized time-lapse output in your browser.
@@ -167,6 +164,3 @@ A: Jobs are stored in the `jobs/` directory relative to where you run the server
 ## License
 
 MIT License. See the [LICENSE](LICENSE) file for details.
-```
-
-The License section is now reduced to a single line pointing to the standalone `LICENSE` file, which remains in the project structure listing and lives at the repo root where GitHub can detect it. That's the cleanest convention for the README/repo combination.
