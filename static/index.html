@@ -1,0 +1,315 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Time Lapse Studio</title>
+<style>
+  :root { --bg:#131318; --panel:#1d1d26; --line:#2c2c3a; --text:#e8e8ef;
+          --muted:#9a9aad; --accent:#7c5cff; --accent-h:#8f74ff;
+          --ok:#3fd68f; --err:#ff6b6b; }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  body { font-family:'Segoe UI',system-ui,sans-serif; background:var(--bg);
+         color:var(--text); min-height:100vh; display:flex; justify-content:center;
+         padding:32px 16px; }
+  .wrap { width:100%; max-width:720px; display:flex; flex-direction:column; gap:20px; }
+  h1 { font-size:1.5rem; letter-spacing:.3px; }
+  h1 span { color:var(--accent); }
+  .sub { color:var(--muted); font-size:.9rem; margin-top:-14px; }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:14px;
+          padding:24px; display:flex; flex-direction:column; gap:16px; }
+  #dropzone { border:2px dashed var(--line); border-radius:10px; padding:36px 16px;
+              text-align:center; cursor:pointer; transition:border-color .2s, background .2s; }
+  #dropzone.drag, #dropzone:hover { border-color:var(--accent); background:#23233466; }
+  #dropzone .big { font-size:1.05rem; }
+  #dropzone .small { color:var(--muted); font-size:.85rem; margin-top:6px; }
+  input[type=file] { display:none; }
+  label { font-size:.85rem; color:var(--muted); display:block; margin-bottom:6px; }
+  select { width:100%; padding:10px 12px; border-radius:8px; border:1px solid var(--line);
+           background:#17171f; color:var(--text); font-size:.95rem; }
+  select:focus { outline:none; border-color:var(--accent); }
+  button { padding:12px 20px; border:none; border-radius:9px; font-size:.95rem;
+           font-weight:600; cursor:pointer; background:var(--accent); color:#fff;
+           transition:background .15s, opacity .15s; }
+  button:hover:not(:disabled) { background:var(--accent-h); }
+  button:disabled { opacity:.45; cursor:not-allowed; }
+  button.secondary { background:#2a2a3a; }
+  .row { display:flex; gap:12px; flex-wrap:wrap; align-items:center; }
+  .meta { display:flex; gap:8px; flex-wrap:wrap; }
+  .chip { background:#232336; border:1px solid var(--line); border-radius:999px;
+          padding:4px 12px; font-size:.8rem; color:var(--muted); }
+  .chip b { color:var(--text); font-weight:600; }
+  .bar-outer { height:10px; background:#232336; border-radius:6px; overflow:hidden; }
+  .bar-inner { height:100%; width:0%; background:linear-gradient(90deg,#7c5cff,#b18cff);
+               transition:width .4s ease; }
+  .status-line { display:flex; justify-content:space-between; font-size:.85rem; color:var(--muted); }
+  .file-info { display:flex; justify-content:space-between; align-items:center;
+               background:#23233466; border:1px solid var(--line); border-radius:8px; padding:12px 16px; }
+  .file-info .name { font-weight:600; word-break:break-all; }
+  video { width:100%; border-radius:10px; background:#000; max-height:420px; }
+  .hidden { display:none !important; }
+  .err { color:var(--err); font-size:.9rem; white-space:pre-wrap; word-break:break-word; }
+  a.dl { color:var(--accent); font-weight:600; text-decoration:none; }
+  a.dl:hover { text-decoration:underline; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>🎬 Time Lapse <span>Studio</span></h1>
+  <p class="sub">Blend one second of frames into a single image — cumulative frame blending powered by ffmpeg.</p>
+
+  <!-- Step 1: upload -->
+  <div class="card" id="step-upload">
+    <div id="dropzone">
+      <div class="big">Drag & drop a video here, or click to browse</div>
+      <div class="small">MP4, MOV, MKV, AVI, WebM … up to 2 GiB</div>
+      <input type="file" id="file-input" accept="video/*">
+    </div>
+    <div class="bar-outer hidden" id="up-bar"><div class="bar-inner" id="up-fill"></div></div>
+    <div class="status-line hidden" id="up-status"></div>
+  </div>
+
+  <!-- Step 2: configure & generate -->
+  <div class="card hidden" id="step-config">
+    <div class="file-info">
+      <span class="name" id="fname"></span>
+      <button class="secondary" id="btn-reset">✕ Replace</button>
+    </div>
+    <div class="meta" id="meta-chips"></div>
+    <div>
+      <label for="mode">Frame blend mode</label>
+      <select id="mode"><option value="">Loading…</option></select>
+    </div>
+    <button id="btn-generate">⚡ Generate time lapse</button>
+    <p class="err hidden" id="cfg-error"></p>
+  </div>
+
+  <!-- Step 3: progress -->
+  <div class="card hidden" id="step-progress">
+    <div class="status-line"><span id="stage">queued</span><span id="pct">0%</span></div>
+    <div class="bar-outer"><div class="bar-inner" id="pr-fill"></div></div>
+    <div class="status-line" style="margin-top:-8px"><span id="counts"></span><span></span></div>
+    <p class="err hidden" id="proc-error"></p>
+    <button class="secondary hidden" id="btn-retry">↻ Start over</button>
+  </div>
+
+  <!-- Step 4: result -->
+  <div class="card hidden" id="step-result">
+    <div class="row" style="justify-content:space-between">
+      <strong>Your time lapse is ready 🎉</strong>
+      <a class="dl" id="dl-link" download>⬇ Download</a>
+    </div>
+    <video id="player" controls playsinline></video>
+    <button class="secondary" id="btn-again">↻ Process another video</button>
+  </div>
+</div>
+
+<script>
+'use strict';
+const $ = id => document.getElementById(id);
+let jobId = null, pollTimer = null, uploadXhr = null, resultTimer = null, configTimer = null;
+
+// ---------- blend modes from server (reflects ITS ffmpeg build) ----------
+fetch('/api/modes').then(r=>r.json()).then(d=>{
+  const sel = $('mode');
+  sel.innerHTML = '';
+  const preferred = ['screen','average','lighten','softlight','overlay','difference'];
+  [...d.modes].sort((a,b)=>{
+    const pa = preferred.indexOf(a), pb = preferred.indexOf(b);
+    return (pa<0?99:pa)-(pb<0?99:pb) || a.localeCompare(b);
+  }).forEach(m=>{
+    const o = document.createElement('option');
+    o.value = m; o.textContent = m;
+    sel.appendChild(o);
+  });
+}).catch(()=>{ $('mode').innerHTML = '<option value="">failed to load modes</option>'; });
+
+// ---------- upload ----------
+const dz = $('dropzone'), fi = $('file-input');
+dz.addEventListener('click', ()=>fi.click());
+dz.addEventListener('dragover', e=>{ e.preventDefault(); dz.classList.add('drag'); });
+dz.addEventListener('dragleave', ()=>dz.classList.remove('drag'));
+dz.addEventListener('drop', e=>{
+  e.preventDefault(); dz.classList.remove('drag');
+  if (e.dataTransfer.files.length) upload(e.dataTransfer.files[0]);
+});
+fi.addEventListener('change', ()=>{
+  if (fi.files.length) upload(fi.files[0]);
+  fi.value = ''; // so picking the same file again still fires change
+});
+
+function fmtBytes(n){
+  if (n >= 1<<30) return (n/(1<<30)).toFixed(2)+' GiB';
+  if (n >= 1<<20) return (n/(1<<20)).toFixed(1)+' MiB';
+  return (n/1024).toFixed(0)+' KiB';
+}
+
+function upload(file){
+  if (uploadXhr) uploadXhr.abort();
+  clearTimeout(configTimer);
+  hideAll();
+  $('step-upload').classList.remove('hidden');
+  $('up-bar').classList.remove('hidden');
+  $('up-status').classList.remove('hidden');
+  $('up-status').textContent = 'Uploading ' + fmtBytes(file.size) + '…';
+
+  const xhr = uploadXhr = new XMLHttpRequest();
+  xhr.open('POST', '/api/upload');
+  xhr.upload.onprogress = e=>{
+    if (e.lengthComputable){
+      const p = e.loaded/e.total*100;
+      $('up-fill').style.width = p+'%';
+      $('up-status').textContent = 'Uploading… '+Math.round(p)+'%';
+    }
+  };
+  xhr.onload = ()=>{
+    if (xhr !== uploadXhr) return; // superseded by a newer upload or reset
+    uploadXhr = null;
+    let data = null;
+    try{ data = JSON.parse(xhr.responseText); }catch(_){}
+    if (xhr.status !== 200 || !data || !data.id){
+      showUploadError((data && data.error) || 'Upload failed (HTTP '+xhr.status+')'); return;
+    }
+    const job = data;
+    jobId = job.id;
+    $('up-fill').style.width='100%';
+    $('up-status').textContent='Upload complete ✓';
+    configTimer = setTimeout(showConfig, 400, job, file.name);
+  };
+  xhr.onerror = ()=>{ if (xhr === uploadXhr){ uploadXhr = null; showUploadError('Network error during upload'); } };
+
+  const fd = new FormData();
+  fd.append('video', file);
+  xhr.send(fd);
+}
+
+function showUploadError(msg){
+  $('up-status').textContent='';
+  $('up-bar').classList.add('hidden');
+  alert(msg);
+}
+
+function showConfig(job, fname){
+  hideAll();
+  $('step-upload').classList.add('hidden');
+  $('step-config').classList.remove('hidden');
+  $('fname').textContent = fname;
+  $('meta-chips').innerHTML =
+    `<span class="chip">fps <b>${job.fps}</b></span>`+
+    `<span class="chip">frames per blend group <b>${job.chunk}</b></span>`+
+    `<span class="chip">job <b>${job.id}</b></span>`;
+}
+
+// ---------- generate ----------
+$('btn-generate').addEventListener('click', async ()=>{
+  const mode = $('mode').value;
+  const errBox = $('cfg-error');
+  errBox.classList.add('hidden');
+  if (!mode){ errBox.textContent='Please wait for blend modes to load.'; errBox.classList.remove('hidden'); return; }
+
+  const btn = $('btn-generate');
+  btn.disabled = true; // prevent double submits
+  try{
+    const res = await fetch('/api/generate/'+jobId, {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({mode})
+    });
+    if (res.status !== 202){
+      const d = await res.json().catch(()=>({}));
+      errBox.textContent = d.error || 'Failed to start processing';
+      errBox.classList.remove('hidden');
+      return;
+    }
+  }catch(e){
+    errBox.textContent = 'Network error: '+e;
+    errBox.classList.remove('hidden');
+    return;
+  }finally{
+    btn.disabled = false;
+  }
+
+  hideAll();
+  $('stage').textContent = 'queued';
+  $('pct').textContent = '0%';
+  $('pr-fill').style.width = '0%';
+  $('counts').textContent = '';
+  $('step-progress').classList.remove('hidden');
+  schedulePoll(jobId);
+});
+
+// setTimeout chain (not setInterval) so slow responses never overlap.
+function schedulePoll(id, delay=1000){
+  pollTimer = setTimeout(()=>poll(id), delay);
+}
+
+function showProcError(msg){
+  const eb = $('proc-error');
+  eb.textContent = '❌ ' + msg;
+  eb.classList.remove('hidden');
+  $('btn-retry').classList.remove('hidden');
+}
+
+async function poll(id){
+  let j;
+  try{
+    const res = await fetch('/api/job/'+id);
+    if (id !== jobId) return; // user reset meanwhile
+    if (!res.ok){
+      const d = await res.json().catch(()=>({}));
+      showProcError(d.error || 'lost track of job (HTTP '+res.status+')');
+      return;
+    }
+    j = await res.json();
+  }catch(_){
+    if (id === jobId) schedulePoll(id, 2000); // transient network error: retry
+    return;
+  }
+
+  $('stage').textContent = j.stage || j.status;
+  $('pct').textContent = Math.round(j.progress)+'%';
+  $('pr-fill').style.width = j.progress+'%';
+  if (j.total_groups){
+    const approx = j.status === 'done' ? '' : '≈';
+    $('counts').textContent =
+      `${j.groups_done || 0}/${approx}${j.total_groups} groups · ${approx}${j.total_frames} frames · mode: ${j.blend_mode}`;
+  }
+
+  if (j.status === 'done'){
+    $('player').src = j.result_url;
+    $('dl-link').href = j.download_url;
+    resultTimer = setTimeout(()=>{ hideAll(); $('step-result').classList.remove('hidden'); }, 500);
+  } else if (j.status === 'failed'){
+    showProcError(j.error || 'processing failed');
+  } else {
+    schedulePoll(id);
+  }
+}
+
+// ---------- misc ----------
+$('btn-reset').addEventListener('click', reset);
+$('btn-again').addEventListener('click', reset);
+$('btn-retry').addEventListener('click', reset);
+
+function hideAll(){
+  ['step-upload','step-config','step-progress','step-result'].forEach(i=>$(i).classList.add('hidden'));
+  ['proc-error','cfg-error','btn-retry'].forEach(i=>$(i).classList.add('hidden'));
+}
+function reset(){
+  clearTimeout(pollTimer);
+  clearTimeout(resultTimer);
+  clearTimeout(configTimer);
+  if (uploadXhr){ uploadXhr.abort(); uploadXhr = null; }
+  $('player').removeAttribute('src'); $('player').load(); // stop playback / release the stream
+  jobId = null;
+  fi.value = '';
+  $('up-fill').style.width='0%';
+  $('up-bar').classList.add('hidden');
+  $('up-status').classList.add('hidden');
+  $('up-status').textContent='';
+  hideAll();
+  $('step-upload').classList.remove('hidden');
+}
+</script>
+</body>
+</html>

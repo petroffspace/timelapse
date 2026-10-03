@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/rand"
 	_ "embed" // required for //go:embed directive
@@ -14,13 +15,14 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"regexp"
-	"runtime"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -32,20 +34,19 @@ const (
 	maxUploadBytes    = 2 << 30 // 2 GiB
 	maxProcessTime    = 2 * time.Hour
 	jobTTL            = 2 * time.Hour
-	framesDirName     = "frames"
-	blendedDirName    = "blended"
 	resultName        = "result.mp4"
-	maxBlendWorkers   = 6
 	maxConcurrentJobs = 2
+	maxChunk          = 120
+	maxSaneFPS        = 240
+	probeTimeout      = 30 * time.Second
 	jobsRoot          = "jobs"
 	fallbackModesStr  = "addition addition128 and average bleach burn darken difference divide dodge extremity exclusion freeze glow grainextract grainmerge hardlight hardmix heat lighten linearlight multiply multiply128 negation normal or overlay phoenix pinlight reflect screen softlight subtract vividlight xor"
 )
 
 var (
-	idRe        = regexp.MustCompile(`^[0-9a-f]{12}$`)
-	alnumRe     = regexp.MustCompile(`^[a-z0-9]+$`)
-	modeTokenRe = regexp.MustCompile(`^[a-z0-9]+$`)
-	allowedModes                 = map[string]bool{}
+	idRe         = regexp.MustCompile(`^[0-9a-f]{12}$`)
+	modeTokenRe  = regexp.MustCompile(`^[a-z0-9]+$`)
+	allowedModes = map[string]bool{}
 )
 
 // ============================================================ job model
@@ -54,6 +55,7 @@ type Status string
 
 const (
 	StatusUploaded   Status = "uploaded"
+	StatusQueued     Status = "queued"
 	StatusProcessing Status = "processing"
 	StatusDone       Status = "done"
 	StatusFailed     Status = "failed"
@@ -71,6 +73,7 @@ type Job struct {
 	FPS         float64
 	Chunk       int
 	InputName   string
+	EstFrames   int
 	TotalFrames int
 	TotalGroups int
 	GroupsDone  int
@@ -103,7 +106,7 @@ func (j *Job) finishOK() {
 		jj.Progress = 100
 		jj.FinishedAt = time.Now()
 	})
-	log.Printf("job %s DONE: %d frames -> %d blended groups", j.ID, j.TotalFrames, j.TotalGroups)
+	log.Printf("job %s DONE: %d blended groups", j.ID, j.GroupsDone)
 }
 
 type jobDTO struct {
@@ -138,7 +141,8 @@ func (j *Job) dto() jobDTO {
 }
 
 func (j *Job) statusSnapshot() (Status, time.Time) {
-	j.mux.Lock(); defer j.mux.Unlock()
+	j.mux.Lock()
+	defer j.mux.Unlock()
 	return j.Status, j.FinishedAt
 }
 
@@ -151,9 +155,10 @@ type store struct {
 
 func newStore() *store { return &store{m: map[string]*Job{}} }
 
-func (s *store) add(j *Job)       { s.mu.Lock(); s.m[j.ID] = j; s.mu.Unlock() }
+func (s *store) add(j *Job) { s.mu.Lock(); s.m[j.ID] = j; s.mu.Unlock() }
 func (s *store) get(id string) (*Job, bool) {
-	s.mu.RLock(); defer s.mu.RUnlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	j, ok := s.m[id]
 	return j, ok
 }
@@ -162,12 +167,14 @@ func (s *store) purge(id string) { s.mu.Lock(); delete(s.m, id); s.mu.Unlock() }
 // ============================================================ app
 
 type app struct {
+	ctx   context.Context // cancelled on shutdown; aborts running jobs
 	store *store
 	sem   chan struct{}
 }
 
-func newApp() *app {
+func newApp(ctx context.Context) *app {
 	return &app{
+		ctx:   ctx,
 		store: newStore(),
 		sem:   make(chan struct{}, maxConcurrentJobs),
 	}
@@ -177,11 +184,33 @@ func (a *app) jobDir(id string) string { return filepath.Join(jobsRoot, id) }
 
 // ============================================================ ffmpeg
 
-func runFFmpeg(ctx context.Context, args ...string) error {
-	cmd := exec.CommandContext(ctx, "ffmpeg", append([]string{"-hide_banner", "-loglevel", "error"}, args...)...)
-	out, err := cmd.CombinedOutput()
+// runFFmpeg runs ffmpeg with machine-readable progress on stdout and calls
+// onFrame with the number of output frames written so far.
+func runFFmpeg(ctx context.Context, onFrame func(int), args ...string) error {
+	full := append([]string{"-hide_banner", "-loglevel", "error", "-nostats", "-progress", "pipe:1"}, args...)
+	cmd := exec.CommandContext(ctx, "ffmpeg", full...)
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		snippet := string(out)
+		return err
+	}
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("cannot start ffmpeg: %w", err)
+	}
+	sc := bufio.NewScanner(stdout)
+	for sc.Scan() {
+		if v, ok := strings.CutPrefix(sc.Text(), "frame="); ok && onFrame != nil {
+			if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil {
+				onFrame(n)
+			}
+		}
+	}
+	if err := cmd.Wait(); err != nil {
+		if ctx.Err() != nil {
+			return fmt.Errorf("ffmpeg aborted: %w", ctx.Err())
+		}
+		snippet := stderr.String()
 		if len(snippet) > 500 {
 			snippet = snippet[len(snippet)-500:]
 		}
@@ -225,28 +254,44 @@ func detectBlendModes() []string {
 	return modes
 }
 
-func parseFraction(s string) (float64, bool) {
+// parseRational parses "num/den" (or a bare integer) into positive integers.
+func parseRational(s string) (num, den int64, ok bool) {
 	s = strings.TrimSpace(s)
-	num, den := s, "1"
-	if i := strings.IndexByte(s, '/'); i >= 0 {
-		num, den = s[:i], s[i+1:]
+	ns, ds, found := strings.Cut(s, "/")
+	if !found {
+		ds = "1"
 	}
-	n, err1 := strconv.ParseFloat(num, 64)
-	d, err2 := strconv.ParseFloat(den, 64)
-	if err1 != nil || err2 != nil || d == 0 || n <= 0 {
+	n, err1 := strconv.ParseInt(ns, 10, 64)
+	d, err2 := strconv.ParseInt(ds, 10, 64)
+	if err1 != nil || err2 != nil || n <= 0 || d <= 0 {
+		return 0, 0, false
+	}
+	return n, d, true
+}
+
+// saneFPS reports whether s is a usable frame-rate fraction. Containers often
+// report bogus r_frame_rate values (e.g. 90000/1) for VFR streams, which would
+// make the fps filter emit a flood of duplicated frames.
+func saneFPS(s string) (float64, bool) {
+	n, d, ok := parseRational(s)
+	if !ok {
 		return 0, false
 	}
-	return n / d, true
+	fps := float64(n) / float64(d)
+	return fps, fps <= maxSaneFPS
 }
 
 type probeInfo struct {
 	FPSFraction string
 	FPS         float64
+	Duration    float64
 }
 
-func probeVideo(path string) (probeInfo, error) {
-	cmd := exec.Command("ffprobe", "-v", "error", "-select_streams", "v:0",
-		"-show_entries", "stream=r_frame_rate,avg_frame_rate",
+func probeVideo(ctx context.Context, path string) (probeInfo, error) {
+	ctx, cancel := context.WithTimeout(ctx, probeTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "ffprobe", "-v", "error", "-select_streams", "v:0",
+		"-show_entries", "stream=r_frame_rate,avg_frame_rate,duration:format=duration",
 		"-of", "json", path)
 	out, err := cmd.Output()
 	if err != nil {
@@ -256,143 +301,145 @@ func probeVideo(path string) (probeInfo, error) {
 		Streams []struct {
 			RFrameRate   string `json:"r_frame_rate"`
 			AvgFrameRate string `json:"avg_frame_rate"`
+			Duration     string `json:"duration"`
 		} `json:"streams"`
+		Format struct {
+			Duration string `json:"duration"`
+		} `json:"format"`
 	}
 	if err := json.Unmarshal(out, &parsed); err != nil || len(parsed.Streams) == 0 {
 		return probeInfo{}, errors.New("no video stream found or unreadable ffprobe output")
 	}
 	st := parsed.Streams[0]
-	frac := st.RFrameRate
-	if _, ok := parseFraction(frac); !ok {
-		frac = st.AvgFrameRate
-	}
-	if _, ok := parseFraction(frac); !ok {
-		frac = "25/1"
-	}
-	fps, _ := parseFraction(frac)
-	return probeInfo{FPSFraction: frac, FPS: fps}, nil
-}
-
-func frameName(n int) string { return fmt.Sprintf("frame_%06d.png", n) }
-
-func listPNGs(dir string) ([]string, error) {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return nil, err
-	}
-	names := make([]string, 0, len(entries))
-	for _, e := range entries {
-		if !e.IsDir() && strings.HasSuffix(e.Name(), ".png") {
-			names = append(names, e.Name())
+	frac := "25/1"
+	for _, cand := range []string{st.RFrameRate, st.AvgFrameRate} {
+		if _, ok := saneFPS(cand); ok {
+			frac = cand
+			break
 		}
 	}
-	sort.Strings(names)
-	return names, nil
+	fps, _ := saneFPS(frac)
+	dur, err := strconv.ParseFloat(st.Duration, 64)
+	if err != nil || dur <= 0 {
+		dur, _ = strconv.ParseFloat(parsed.Format.Duration, 64)
+	}
+	return probeInfo{FPSFraction: frac, FPS: fps, Duration: dur}, nil
 }
 
-func min(a, b int) int { if a < b { return a }; return b }
+// buildFilterGraph blends every consecutive `chunk` frames into one output
+// frame in a single ffmpeg pass. The stream is split into `chunk` branches;
+// branch k keeps frames with n%chunk == k and is retimed so that all frames of
+// group g share timestamp g, letting the blend chain pair them up. For a short
+// final group, eof_action=pass forwards the partial blend unchanged.
+//
+// format=rgb24 before gbrp mirrors the former PNG-intermediate pipeline
+// (blend runs on planar RGB), keeping results bit-identical to it.
+//
+// "average" uses tmix instead: chaining pairwise blend=average halves the
+// weight of earlier frames at every step, whereas tmix gives every frame of
+// the group equal weight. See dropsPartialGroup for the tail caveat.
+func buildFilterGraph(fpsFrac string, chunk int, mode string) (string, error) {
+	num, den, ok := parseRational(fpsFrac)
+	if !ok {
+		return "", fmt.Errorf("invalid frame rate %q", fpsFrac)
+	}
+	const encodePrep = "scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p"
+	var fc strings.Builder
+	fmt.Fprintf(&fc, "[0:v]fps=%d/%d,format=rgb24,format=gbrp", num, den)
+	if chunk <= 1 {
+		fc.WriteString("," + encodePrep + "[out]")
+		return fc.String(), nil
+	}
+	if dropsPartialGroup(mode, chunk) {
+		// tmix emits a sliding-window mean per input frame; keep only the frame
+		// that closes each group, when the window spans exactly that group.
+		fmt.Fprintf(&fc, `,tmix=frames=%d,select='eq(mod(n\,%d)\,%d)',settb=%d/%d,setpts=N,%s[out]`,
+			chunk, chunk, chunk-1, den, num, encodePrep)
+		return fc.String(), nil
+	}
+	fmt.Fprintf(&fc, ",split=%d", chunk)
+	for k := 0; k < chunk; k++ {
+		fmt.Fprintf(&fc, "[s%d]", k)
+	}
+	fc.WriteByte(';')
+	for k := 0; k < chunk; k++ {
+		fmt.Fprintf(&fc, `[s%d]select='eq(mod(n\,%d)\,%d)',settb=%d/%d,setpts=N[t%d];`, k, chunk, k, den, num, k)
+	}
+	prev := "t0"
+	for k := 1; k < chunk; k++ {
+		fmt.Fprintf(&fc, "[%s][t%d]blend=all_mode=%s:eof_action=pass[b%d];", prev, k, mode, k)
+		prev = fmt.Sprintf("b%d", k)
+	}
+	fmt.Fprintf(&fc, "[%s]%s[out]", prev, encodePrep)
+	return fc.String(), nil
+}
+
+// dropsPartialGroup reports whether a short final group is discarded. tmix's
+// window always spans `chunk` frames and select can't detect end of stream,
+// so for "average" the trailing frames (< chunk, under ~1s of source) that
+// don't fill a whole group produce no output frame.
+func dropsPartialGroup(mode string, chunk int) bool {
+	return mode == "average" && chunk > 1
+}
 
 // ============================================================ pipeline
 
-func process(ctx context.Context, j *Job, blendMode string, a *app) {
+func process(ctx context.Context, j *Job, a *app) {
+	dir := a.jobDir(j.ID)
+	ok := false
+	defer func() {
+		if !ok {
+			os.RemoveAll(dir) // failed jobs cannot be retried; free the disk now
+		}
+	}()
+
 	select {
 	case a.sem <- struct{}{}:
 		defer func() { <-a.sem }()
 	case <-ctx.Done():
-		j.fail(errors.New("cancelled")); return
+		j.fail(errors.New("cancelled"))
+		return
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, maxProcessTime)
 	defer cancel()
 
-	j.mutate(func(jj *Job) { jj.Status = StatusProcessing; jj.BlendMode = blendMode })
+	j.mux.Lock()
+	j.Status = StatusProcessing
+	mode, chunk, estFrames := j.BlendMode, j.Chunk, j.EstFrames
+	j.mux.Unlock()
 
-	dir := a.jobDir(j.ID)
-	inputPath := filepath.Join(dir, j.InputName)
-	framesDir := filepath.Join(dir, framesDirName)
-	blendedDir := filepath.Join(dir, blendedDirName)
-
-	j.setStage("extracting_frames", 0)
-	if err := os.MkdirAll(framesDir, 0o755); err != nil {
-		j.fail(err); return
-	}
-	if err := runFFmpeg(ctx,
-		"-i", inputPath,
-		"-vf", "fps="+j.FPSFraction,
-		"-vsync", "0",
-		"-start_number", "1",
-		filepath.Join(framesDir, "frame_%06d.png"),
-	); err != nil {
-		j.fail(fmt.Errorf("frame extraction failed: %w", err)); return
-	}
-
-	frames, err := listPNGs(framesDir)
+	graph, err := buildFilterGraph(j.FPSFraction, chunk, mode)
 	if err != nil {
-		j.fail(err); return
-	}
-	total := len(frames)
-	if total == 0 {
-		j.fail(errors.New("no frames extracted")); return
-	}
-	chunk := j.Chunk
-	groups := (total + chunk - 1) / chunk
-	j.mutate(func(jj *Job) {
-		jj.TotalFrames = total
-		jj.TotalGroups = groups
-	})
-
-	j.setStage("blending_groups", 2)
-	if err := os.MkdirAll(blendedDir, 0o755); err != nil {
-		j.fail(err); return
+		j.fail(err)
+		return
 	}
 
-	errCh := make(chan error, groups)
-	var wg sync.WaitGroup
-	work := make(chan int, groups)
-	for g := 0; g < groups; g++ {
-		work <- g
+	dropTail := dropsPartialGroup(mode, chunk)
+	estGroups := (estFrames + chunk - 1) / chunk
+	if dropTail {
+		estGroups = estFrames / chunk
 	}
-	close(work)
+	j.mutate(func(jj *Job) { jj.TotalFrames = estFrames; jj.TotalGroups = estGroups })
+	j.setStage("blending_and_encoding", 0)
 
-	workers := maxBlendWorkers
-	if workers > runtime.NumCPU() { workers = runtime.NumCPU() }
-	if workers > groups { workers = groups }
-	if workers < 1 { workers = 1 }
-
-	for w := 0; w < workers; w++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for g := range work {
-				if err := blendGroup(ctx, j, g, chunk, total, framesDir, blendedDir, blendMode); err != nil {
-					errCh <- fmt.Errorf("group %d: %w", g, err)
-					cancel()
-					return
-				}
-				j.mutate(func(jj *Job) { jj.GroupsDone++ })
-				done := 0
-				j.mux.Lock(); done = j.GroupsDone; j.mux.Unlock()
-				j.mutate(func(jj *Job) {
-					jj.Progress = 2 + 88*float64(done)/float64(groups)
-				})
+	inputPath := filepath.Join(dir, j.InputName)
+	onFrame := func(n int) {
+		j.mutate(func(jj *Job) {
+			jj.GroupsDone = n
+			if n > jj.TotalGroups {
+				jj.TotalGroups = n
 			}
-		}()
+			if jj.TotalGroups > 0 {
+				jj.Progress = math.Min(99, 100*float64(n)/float64(jj.TotalGroups))
+			}
+		})
 	}
-	wg.Wait()
-	close(errCh)
-
-	if err := <-errCh; err != nil {
-		j.fail(err); return
-	}
-
-	os.RemoveAll(framesDir)
-
-	j.setStage("encoding_video", 92)
-	if err := runFFmpeg(ctx,
-		"-framerate", j.FPSFraction, // ORIGINAL fps, not 1
-		"-start_number", "1",
-		"-i", filepath.Join(blendedDir, "frame_%06d.png"),
-		"-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p",
+	if err := runFFmpeg(ctx, onFrame,
+		"-i", inputPath,
+		"-filter_complex", graph,
+		"-map", "[out]",
+		"-fps_mode", "passthrough",
 		"-c:v", "libx264",
 		"-preset", "medium",
 		"-crf", "18",
@@ -400,71 +447,35 @@ func process(ctx context.Context, j *Job, blendMode string, a *app) {
 		"-an",
 		filepath.Join(dir, resultName),
 	); err != nil {
-		j.fail(fmt.Errorf("video encoding failed: %w", err)); return
+		j.fail(fmt.Errorf("processing failed: %w", err))
+		return
 	}
 
-	os.RemoveAll(blendedDir)
+	j.mux.Lock()
+	groups := j.GroupsDone
+	j.mux.Unlock()
+	if groups == 0 {
+		if dropTail {
+			j.fail(fmt.Errorf("video too short: average mode needs at least %d frames", chunk))
+			return
+		}
+		j.fail(errors.New("no frames produced"))
+		return
+	}
+	// Exact input frame count isn't reported; clamp the estimate into the
+	// range consistent with the number of groups actually produced.
+	j.mutate(func(jj *Job) {
+		jj.TotalGroups = groups
+		lo, hi := (groups-1)*chunk+1, groups*chunk
+		if dropTail {
+			lo, hi = groups*chunk, (groups+1)*chunk-1
+		}
+		jj.TotalFrames = max(min(jj.TotalFrames, hi), lo)
+	})
+
+	ok = true
+	os.Remove(inputPath) // only the result is served from here on
 	j.finishOK()
-}
-
-func blendGroup(ctx context.Context, j *Job, g, chunk, total int, framesDir, blendedDir, mode string) error {
-	first := g*chunk + 1
-	last := min((g+1)*chunk, total)
-	m := last - first + 1
-
-	src := make([]string, m)
-	for i := 0; i < m; i++ {
-		src[i] = filepath.Join(framesDir, frameName(first+i))
-	}
-
-	if _, err := os.Stat(src[0]); err != nil {
-		return fmt.Errorf("background frame missing: %w", err)
-	}
-
-	outPath := filepath.Join(blendedDir, frameName(g+1))
-
-	if m == 1 {
-		data, err := os.ReadFile(src[0])
-		if err != nil {
-			return err
-		}
-		return os.WriteFile(outPath, data, 0o644)
-	}
-
-	args := make([]string, 0, 2*m+12)
-	for _, p := range src {
-		args = append(args, "-i", p)
-	}
-
-	var fc strings.Builder
-	prev := "0:v"
-	for k := 1; k < m; k++ {
-		fmt.Fprintf(&fc, "[%s][%d:v]blend=all_mode=%s[b%d];", prev, k, mode, k)
-		prev = fmt.Sprintf("b%d", k)
-	}
-	graph := strings.TrimSuffix(fc.String(), ";")
-	if graph == "" {
-		return errors.New("empty filter graph")
-	}
-
-	args = append(args,
-		"-filter_complex", graph,
-		"-map", "["+prev+"]",
-		"-frames:v", "1",
-		"-update", "1",
-		outPath,
-	)
-
-	if err := runFFmpeg(ctx, args...); err != nil {
-		return err
-	}
-
-	for _, p := range src {
-		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
-			return err
-		}
-	}
-	return nil
 }
 
 // ============================================================ handlers
@@ -481,11 +492,13 @@ func jsonErr(w http.ResponseWriter, code int, msg string) {
 
 func newID() string {
 	b := make([]byte, 6)
-	rand.Read(b)
+	if _, err := rand.Read(b); err != nil {
+		panic(err) // crypto/rand never fails on supported platforms
+	}
 	return hex.EncodeToString(b)
 }
 
-func (a *app) sanitizeExtension(name string) string {
+func sanitizeExtension(name string) string {
 	ext := strings.ToLower(filepath.Ext(name))
 	switch ext {
 	case ".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v", ".mpg", ".mpeg", ".ts":
@@ -495,132 +508,178 @@ func (a *app) sanitizeExtension(name string) string {
 	}
 }
 
+// saveUpload streams the "video" multipart field straight into dir, avoiding
+// the temp-file copy that ParseMultipartForm makes for large uploads.
+func saveUpload(r *http.Request, dir string) (name string, size int64, status int, err error) {
+	mr, err := r.MultipartReader()
+	if err != nil {
+		return "", 0, http.StatusBadRequest, errors.New("expected multipart/form-data")
+	}
+	for {
+		part, err := mr.NextPart()
+		if err == io.EOF {
+			return "", 0, http.StatusBadRequest, errors.New(`missing field "video"`)
+		}
+		if err != nil {
+			return "", 0, uploadErrStatus(err), errors.New("upload too large or malformed")
+		}
+		if part.FormName() != "video" {
+			part.Close()
+			continue
+		}
+		name = "input" + sanitizeExtension(part.FileName())
+		dst, err := os.Create(filepath.Join(dir, name))
+		if err != nil {
+			return "", 0, http.StatusInternalServerError, errors.New("cannot write file")
+		}
+		size, err = io.Copy(dst, part)
+		if cerr := dst.Close(); err == nil {
+			err = cerr
+		}
+		if err != nil {
+			return "", 0, uploadErrStatus(err), errors.New("failed saving upload")
+		}
+		return name, size, 0, nil
+	}
+}
+
+func uploadErrStatus(err error) int {
+	var mbe *http.MaxBytesError
+	if errors.As(err, &mbe) {
+		return http.StatusRequestEntityTooLarge
+	}
+	return http.StatusBadRequest
+}
+
 func (a *app) handleUpload(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxUploadBytes)
-	if err := r.ParseMultipartForm(32 << 20); err != nil {
-		jsonErr(w, http.StatusBadRequest, "upload too large or malformed")
-		return
-	}
-	file, hdr, err := r.FormFile("video")
-	if err != nil {
-		jsonErr(w, http.StatusBadRequest, `missing field "video"`)
-		return
-	}
-	defer file.Close()
 
 	id := newID()
 	dir := a.jobDir(id)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
-		jsonErr(w, http.StatusInternalServerError, "cannot create job directory"); return
+		jsonErr(w, http.StatusInternalServerError, "cannot create job directory")
+		return
 	}
+	keep := false
+	defer func() {
+		if !keep {
+			os.RemoveAll(dir)
+		}
+	}()
 
-	inName := "input" + a.sanitizeExtension(hdr.Filename)
-	dst, err := os.Create(filepath.Join(dir, inName))
+	inName, size, code, err := saveUpload(r, dir)
 	if err != nil {
-		jsonErr(w, http.StatusInternalServerError, "cannot write file"); return
-	}
-	size, err := io.Copy(dst, file)
-	dst.Close()
-	if err != nil {
-		os.RemoveAll(dir)
-		jsonErr(w, http.StatusInternalServerError, "failed saving upload"); return
+		jsonErr(w, code, err.Error())
+		return
 	}
 	if size == 0 {
-		os.RemoveAll(dir)
-		jsonErr(w, http.StatusBadRequest, "empty file"); return
+		jsonErr(w, http.StatusBadRequest, "empty file")
+		return
 	}
 
-	info, err := probeVideo(filepath.Join(dir, inName))
+	info, err := probeVideo(r.Context(), filepath.Join(dir, inName))
 	if err != nil {
-		os.RemoveAll(dir)
-		jsonErr(w, http.StatusBadRequest, "not a readable video: "+err.Error()); return
+		jsonErr(w, http.StatusBadRequest, "not a readable video: "+err.Error())
+		return
 	}
 
-	chunk := int(math.Round(info.FPS))
-	if chunk < 1 { chunk = 1 }
-	if chunk > 120 { chunk = 120 }
+	chunk := min(max(int(math.Round(info.FPS)), 1), maxChunk)
 
 	j := &Job{
 		ID: id, Status: StatusUploaded, Stage: "awaiting_generate", CreatedAt: time.Now(),
 		FPSFraction: info.FPSFraction, FPS: math.Round(info.FPS*1000) / 1000, Chunk: chunk, InputName: inName,
+		EstFrames: int(math.Round(info.Duration * info.FPS)),
 	}
+	keep = true
 	a.store.add(j)
-	log.Printf("upload %s: %.1f MiB, fps=%s (%.3f) -> chunk=%d", id, float64(size)/(1<<20), info.FPSFraction, info.FPS, chunk)
+	log.Printf("upload %s: %.1f MiB, fps=%s (%.3f), %.1fs -> chunk=%d", id, float64(size)/(1<<20), info.FPSFraction, info.FPS, info.Duration, chunk)
 
 	writeJSON(w, http.StatusOK, j.dto())
 }
 
-func (a *app) handleGenerate(w http.ResponseWriter, r *http.Request) {
+// lookupJob resolves the {id} path value, writing a 404 if it is unknown.
+func (a *app) lookupJob(w http.ResponseWriter, r *http.Request) (*Job, bool) {
 	id := r.PathValue("id")
-	if !idRe.MatchString(id) {
-		jsonErr(w, http.StatusNotFound, "unknown job"); return
+	if idRe.MatchString(id) {
+		if j, ok := a.store.get(id); ok {
+			return j, true
+		}
 	}
-	j, ok := a.store.get(id)
+	jsonErr(w, http.StatusNotFound, "unknown job")
+	return nil, false
+}
+
+func (a *app) handleGenerate(w http.ResponseWriter, r *http.Request) {
+	j, ok := a.lookupJob(w, r)
 	if !ok {
-		jsonErr(w, http.StatusNotFound, "unknown job"); return
+		return
 	}
 
-	var body struct{ Mode string `json:"mode"` }
+	var body struct {
+		Mode string `json:"mode"`
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 4<<10)
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Mode == "" {
-		jsonErr(w, http.StatusBadRequest, `missing "mode" in body`); return
+		jsonErr(w, http.StatusBadRequest, `missing "mode" in body`)
+		return
 	}
 	mode := strings.ToLower(body.Mode)
-	if !alnumRe.MatchString(mode) || !allowedModes[mode] {
-		jsonErr(w, http.StatusBadRequest, "unsupported blend mode: "+body.Mode); return
+	if !allowedModes[mode] {
+		jsonErr(w, http.StatusBadRequest, "unsupported blend mode: "+body.Mode)
+		return
 	}
 
-	st, _ := j.statusSnapshot()
+	// Check-and-transition atomically so concurrent requests can't start the
+	// same job twice.
+	j.mux.Lock()
+	st := j.Status
+	if st == StatusUploaded {
+		j.Status, j.Stage, j.BlendMode = StatusQueued, "queued", mode
+	}
+	j.mux.Unlock()
 	switch st {
-	case StatusProcessing:
-		jsonErr(w, http.StatusConflict, "already processing"); return
+	case StatusUploaded:
+	case StatusQueued, StatusProcessing:
+		jsonErr(w, http.StatusConflict, "already processing")
+		return
 	case StatusDone:
-		jsonErr(w, http.StatusConflict, "already finished"); return
-	case StatusFailed:
-		jsonErr(w, http.StatusConflict, "job previously failed"); return
+		jsonErr(w, http.StatusConflict, "already finished")
+		return
+	default:
+		jsonErr(w, http.StatusConflict, "job previously failed")
+		return
 	}
 
-	go process(context.Background(), j, mode, a)
+	go process(a.ctx, j, a)
 	writeJSON(w, http.StatusAccepted, j.dto())
 }
 
 func (a *app) handleJobStatus(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	if !idRe.MatchString(id) {
-		jsonErr(w, http.StatusNotFound, "unknown job"); return
+	if j, ok := a.lookupJob(w, r); ok {
+		writeJSON(w, http.StatusOK, j.dto())
 	}
-	j, ok := a.store.get(id)
-	if !ok {
-		jsonErr(w, http.StatusNotFound, "unknown job"); return
-	}
-	writeJSON(w, http.StatusOK, j.dto())
 }
 
 func (a *app) handleResult(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	if !idRe.MatchString(id) {
-		jsonErr(w, http.StatusNotFound, "unknown job"); return
-	}
-	j, ok := a.store.get(id)
+	j, ok := a.lookupJob(w, r)
 	if !ok {
-		jsonErr(w, http.StatusNotFound, "unknown job"); return
+		return
 	}
 	if st, _ := j.statusSnapshot(); st != StatusDone {
-		jsonErr(w, http.StatusConflict, "result not ready"); return
+		jsonErr(w, http.StatusConflict, "result not ready")
+		return
 	}
-	path := filepath.Join(a.jobDir(id), resultName)
 	if r.URL.Query().Get("download") == "1" {
-		w.Header().Set("Content-Disposition", `attachment; filename="timelapse_`+id+`.mp4"`)
+		w.Header().Set("Content-Disposition", `attachment; filename="timelapse_`+j.ID+`.mp4"`)
 	}
-	http.ServeFile(w, r, path)
+	http.ServeFile(w, r, filepath.Join(a.jobDir(j.ID), resultName))
 }
 
-func handleModes(w http.ResponseWriter, r *http.Request) {
-	modes := make([]string, 0, len(allowedModes))
-	for m := range allowedModes {
-		modes = append(modes, m)
+func handleModes(modesJSON []byte) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(modesJSON)
 	}
-	sort.Strings(modes)
-	writeJSON(w, http.StatusOK, map[string]any{"modes": modes})
 }
 
 func handleIndex(w http.ResponseWriter, r *http.Request) {
@@ -632,34 +691,50 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
 
 func (a *app) janitor() {
 	ticker := time.NewTicker(10 * time.Minute)
-	for range ticker.C {
+	defer ticker.Stop()
+	for {
+		select {
+		case <-a.ctx.Done():
+			return
+		case <-ticker.C:
+		}
 		cutoff := time.Now().Add(-jobTTL)
-		for _, id := range a.listIDs() {
-			j, ok := a.store.get(id)
-			if !ok { continue }
+		for _, j := range a.store.list() {
 			st, fin := j.statusSnapshot()
-			if st == StatusDone || st == StatusFailed {
-				if fin.Before(cutoff) {
-					os.RemoveAll(a.jobDir(id))
-					a.store.purge(id)
-					log.Printf("janitor: expired job %s", id)
-				}
-			} else if st == StatusUploaded && j.CreatedAt.Before(cutoff) {
-				os.RemoveAll(a.jobDir(id))
-				a.store.purge(id)
-				log.Printf("janitor: expired unstarted job %s", id)
+			expired := (st == StatusDone || st == StatusFailed) && fin.Before(cutoff) ||
+				st == StatusUploaded && j.CreatedAt.Before(cutoff)
+			if expired {
+				os.RemoveAll(a.jobDir(j.ID))
+				a.store.purge(j.ID)
+				log.Printf("janitor: expired %s job %s", st, j.ID)
 			}
 		}
 	}
 }
 
-func (a *app) listIDs() []string {
-	a.store.mu.RLock(); defer a.store.mu.RUnlock()
-	ids := make([]string, 0, len(a.store.m))
-	for id := range a.store.m {
-		ids = append(ids, id)
+func (s *store) list() []*Job {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	jobs := make([]*Job, 0, len(s.m))
+	for _, j := range s.m {
+		jobs = append(jobs, j)
 	}
-	return ids
+	return jobs
+}
+
+// removeStaleJobDirs deletes job directories left over from a previous run;
+// the job store is in-memory, so they can never be served again.
+func removeStaleJobDirs() {
+	entries, err := os.ReadDir(jobsRoot)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if e.IsDir() && idRe.MatchString(e.Name()) {
+			os.RemoveAll(filepath.Join(jobsRoot, e.Name()))
+			log.Printf("removed stale job dir %s", e.Name())
+		}
+	}
 }
 
 // ============================================================ main
@@ -667,31 +742,47 @@ func (a *app) listIDs() []string {
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 
-	allowedModes = map[string]bool{}
-	for _, m := range detectBlendModes() {
+	modes := detectBlendModes()
+	for _, m := range modes {
 		allowedModes[m] = true
 	}
-	if !allowedModes["screen"] {
-		allowedModes["screen"] = true
-	}
+	modesJSON, _ := json.Marshal(map[string]any{"modes": modes})
 
 	if err := os.MkdirAll(jobsRoot, 0o755); err != nil {
 		log.Fatalf("cannot create %s: %v", jobsRoot, err)
 	}
+	removeStaleJobDirs()
 
-	a := newApp()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	a := newApp(ctx)
 	go a.janitor()
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /", handleIndex)
-	mux.HandleFunc("GET /api/modes", handleModes)
+	mux.HandleFunc("GET /{$}", handleIndex)
+	mux.HandleFunc("GET /api/modes", handleModes(modesJSON))
 	mux.HandleFunc("POST /api/upload", a.handleUpload)
 	mux.HandleFunc("POST /api/generate/{id}", a.handleGenerate)
 	mux.HandleFunc("GET /api/job/{id}", a.handleJobStatus)
 	mux.HandleFunc("GET /api/result/{id}", a.handleResult)
 
+	srv := &http.Server{
+		Addr:              listenAddr,
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       2 * time.Minute,
+	}
+	go func() {
+		<-ctx.Done()
+		log.Println("shutting down")
+		shCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		srv.Shutdown(shCtx)
+	}()
+
 	log.Printf("listening on %s — open http://localhost%s/", listenAddr, listenAddr)
-	if err := http.ListenAndServe(listenAddr, mux); err != nil {
+	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatal(err)
 	}
 }

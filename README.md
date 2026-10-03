@@ -1,166 +1,132 @@
 # Time Lapse Studio
 
-A web-based application that transforms videos into motion-blur time lapses using cumulative frame blending. Upload any video, select a blend mode, and generate a stylized time-lapse output in your browser.
+A small Go web app that turns a video into a time lapse by blending frames
+together: every second of footage (one group of frames) becomes a single
+blended frame, using any of ffmpeg's blend modes.
 
-<p align="center">
-  <img src="assets/screenshot.png" alt="Time Lapse Studio UI" width="600"/>
-</p>
+![screenshot](assets/screenshot.png)
 
-## Features
+## Requirements
 
-- Drag and drop upload with support for MP4, MOV, MKV, AVI, WebM (up to 2 GiB)
-- Multiple blend modes: choose from 30+ FFmpeg blend modes (screen, overlay, difference, lighten, etc.)
-- Accurate framerate detection: handles variable frame rate (VFR) sources correctly
-- Real-time progress tracking: monitor processing stages and completion percentage
-- Inline playback: preview and download your time-lapse immediately after generation
-- Automatic cleanup: jobs are purged after 2 hours to save disk space
+- Go 1.22+
+- `ffmpeg` and `ffprobe` on `PATH` (the blend modes offered are detected from
+  the local ffmpeg build at startup)
 
-## How It Works
+## Running
 
-The app performs three phases of video processing:
+```sh
+go run .
+# or
+go build -o timelapse . && ./timelapse
+```
 
-1. Extraction: the source video is split into individual PNG frames at the probed framerate (for example, 30 fps produces 30 frames per second).
-2. Blending: frames are grouped by source second and cumulatively blended together. Frame 1 acts as the background; frames 2 through N are overlaid using the selected blend mode.
-3. Encoding: the blended frames are reassembled into an H.264 MP4 at the original video framerate.
+Then open <http://localhost:9595/>, drop a video, pick a blend mode and click
+**Generate**. If processing fails, the error is shown with a **Start over**
+button. Ctrl+C shuts the server down gracefully and aborts running jobs.
 
-Result: a 120-second, 30 fps video becomes 120 blended frames, producing a 4-second, 30 fps output (approximately 30x speedup).
+Job files live under `./jobs/` (relative to the working directory). Jobs are
+kept in memory only, so any leftover job directories are removed on startup.
 
-## Prerequisites
+## Building for other platforms
 
-- Go 1.22 or newer
-- FFmpeg: both `ffmpeg` and `ffprobe` binaries must be on your system PATH
+The release archive contains source only. Go cross-compiles without extra
+tooling; the web UI is embedded, so the result is a single self-contained
+binary (it still needs `ffmpeg`/`ffprobe` on `PATH` on the target machine).
+Set `GOOS`/`GOARCH` for the target:
 
-### Installing FFmpeg
+```sh
+# Linux
+CGO_ENABLED=0 GOOS=linux   GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o timelapse-linux-amd64 .
+CGO_ENABLED=0 GOOS=linux   GOARCH=arm64 go build -trimpath -ldflags "-s -w" -o timelapse-linux-arm64 .
+# macOS (Intel / Apple Silicon)
+CGO_ENABLED=0 GOOS=darwin  GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o timelapse-darwin-amd64 .
+CGO_ENABLED=0 GOOS=darwin  GOARCH=arm64 go build -trimpath -ldflags "-s -w" -o timelapse-darwin-arm64 .
+# Windows
+CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o timelapse-windows-amd64.exe .
+```
 
-macOS (Homebrew):
+On Windows PowerShell, set the variables first instead:
 
-    brew install ffmpeg
+```powershell
+$env:CGO_ENABLED="0"; $env:GOOS="windows"; $env:GOARCH="amd64"
+go build -trimpath -ldflags "-s -w" -o timelapse.exe .
+```
 
-Linux (Ubuntu/Debian):
+`go tool dist list` shows every supported `GOOS/GOARCH` pair.
 
-    sudo apt-get update && sudo apt-get install ffmpeg
+## How it works
 
-Windows (Chocolatey):
+1. **Upload**: the video is streamed to `jobs/<id>/` and probed with `ffprobe`
+   for its frame rate and duration. The group size (`chunk`) is the frame rate
+   rounded, clamped to 1–120.
+2. **Generate**: a single ffmpeg pass:
+   - normalises to the source frame rate and converts to planar RGB;
+   - blends each group of `chunk` consecutive frames into one frame:
+     - **most modes**: the stream is split into `chunk` branches that are
+       chained through `blend=all_mode=<mode>`, so frame 1 is blended with
+       frame 2, that result with frame 3, and so on;
+     - **`average`**: `tmix` gives every frame in the group equal weight (a
+       chained pairwise average would favour the latest frames);
+   - encodes the result as H.264 MP4 at the original frame rate, so the output
+     plays about `chunk`× faster than the source.
+3. **Result**: served for preview and download. The uploaded input is deleted
+   once the result is ready; failed jobs are deleted immediately.
 
-    choco install ffmpeg
+### Notes
 
-Verify installation:
+- **`average` drops a partial tail**: the last frames that don't fill a whole
+  group (under one second of footage) produce no output frame in `average`
+  mode. Other modes blend them into a final, partial frame. A clip shorter than
+  one group fails with an error in `average` mode.
+- **Memory**: all frames of a group are held in memory while it is blended.
+  Expect roughly 1.8 GB peak per job for 1080p at 120 fps (the largest group
+  size); 4K at high frame rates needs several GB. Lower `maxConcurrentJobs` or
+  `maxChunk` on small machines.
+- **Exposure**: the server listens on all interfaces and has no
+  authentication or limit on concurrent uploads (each may use up to 2 GiB of
+  disk for up to `jobTTL`). For anything beyond local use, set `listenAddr` to
+  `127.0.0.1:9595` or put it behind an authenticating reverse proxy.
+- Frame and group counts are estimated from the duration while processing and
+  shown with `≈` until the job finishes.
 
-    ffmpeg -version
-    ffprobe -version
+## Configuration
 
-## Installation
+Settings are constants at the top of `main.go`:
 
-1. Clone the repository:
+| Constant            | Default  | Meaning                                           |
+|---------------------|----------|---------------------------------------------------|
+| `listenAddr`        | `:9595`  | HTTP listen address                               |
+| `maxUploadBytes`    | 2 GiB    | Upload size limit (larger uploads get HTTP 413)   |
+| `maxConcurrentJobs` | 2        | Jobs processed at once; others wait as `queued`   |
+| `maxChunk`          | 120      | Maximum frames per blend group                    |
+| `maxSaneFPS`        | 240      | Higher reported frame rates are treated as bogus  |
+| `maxProcessTime`    | 2 h      | Per-job processing timeout                        |
+| `jobTTL`            | 2 h      | Finished, failed and never-started jobs are deleted after this |
 
-       git clone https://github.com/yourusername/timelapse-studio.git
-       cd timelapse-studio
+## HTTP API
 
-2. Initialize Go modules (if not already done):
+| Method & path              | Description                                              |
+|----------------------------|----------------------------------------------------------|
+| `GET /api/modes`           | `{"modes": [...]}`: blend modes supported by local ffmpeg |
+| `POST /api/upload`         | multipart form, field `video`; returns the job            |
+| `POST /api/generate/{id}`  | JSON `{"mode": "screen"}`; starts processing (202)        |
+| `GET /api/job/{id}`        | job status and progress                                  |
+| `GET /api/result/{id}`     | the MP4 (`?download=1` sends it as an attachment)        |
 
-       go mod init timelapse
+Job status goes `uploaded` → `queued` → `processing` → `done` / `failed`.
+`generate` returns 409 if the job has already started, finished or failed.
 
-3. Download dependencies:
-
-       go mod tidy
-
-## Running Locally
-
-Start the server:
-
-    go run .
-
-The server listens on http://localhost:9595/. Open that URL in your browser to begin uploading videos.
-
-## Architecture
-
-### Project Structure
-
-    timelapse-studio/
-    |-- main.go                 HTTP server + FFmpeg pipeline
-    |-- go.mod                  Go module definition
-    |-- go.sum                  Dependency checksums
-    |-- LICENSE                 MIT license
-    |-- README.md               This file
-    `-- static/
-        `-- index.html          Frontend UI (embedded)
-
-### Key Components
-
-| Component | Description |
-|-----------|-------------|
-| HTTP Server | Standard library net/http with custom routes for upload/status/result |
-| Job Store | In-memory job registry with mutex-protected concurrent access |
-| FFmpeg Pipeline | Three-phase process: extract, blend, encode (runs as subprocess via os/exec) |
-| Blend Workers | Up to 6 concurrent FFmpeg invocations for parallel group processing |
-| Janitor | Background goroutine that cleans expired jobs every 10 minutes |
-
-### API Endpoints
-
-| Method | Path | Description |
-|--------|------|-------------|
-| GET | `/` | Serve UI (static HTML) |
-| GET | `/api/modes` | List supported blend modes (JSON) |
-| POST | `/api/upload` | Upload video file (multipart/form-data) |
-| POST | `/api/generate/{id}` | Start processing with selected blend mode |
-| GET | `/api/job/{id}` | Poll job status and progress |
-| GET | `/api/result/{id}?download=1` | Stream result video or download as attachment |
-
-### Blend Modes Supported
-
-Common options include:
-
-- `screen`, `overlay`, `softlight`, `hardlight` — creative lighting effects
-- `addition`, `difference`, `exclude` — motion trail emphasis
-- `multiply`, `darken`, `lighten` — exposure adjustments
-- `grainmerge`, `grainextract` — texture overlays
-
-The full list depends on your installed FFmpeg version and is shown in the UI after launch.
-
-## Security Considerations
-
-- Upload limit is set to 2 GiB per file (`maxUploadBytes` in code)
-- Each job runs in its own temporary directory under `jobs/`
-- Job IDs are validated as 12-character hex strings, preventing path traversal
-- All processing is local; no data leaves your machine
-
-## Known Limitations
-
-| Issue | Workaround |
-|-------|------------|
-| Very long videos (30+ minutes) may exhaust disk during frame extraction | Add windowed extraction (`-ss`/`-t` per group), planned for v2 |
-| Sub-1-second outputs for clips shorter than one blend group | Enforce minimum frame repetition, planned for v2 |
-| No estimated time remaining (processing time varies by video complexity) | Linear progress is shown instead |
-| No audio passthrough | Audio is stripped intentionally (`-an` flag) |
-
-## Contributing
-
-Pull requests are welcome. For major changes, please open an issue first to discuss what you would like to change.
-
-1. Fork the repository
-2. Create your feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
-
-## FAQ
-
-**Q: Why is my output much shorter than my source video?**
-
-A: This is expected. The app compresses time by blending N frames into one image. A 30 fps source produces an output roughly 30 times faster than the original duration.
-
-**Q: Can I change the output framerate?**
-
-A: Currently it matches the source framerate exactly. To change it, modify the `-framerate` flag in the encoding phase of `main.go`.
-
-**Q: My FFmpeg blend-mode detection failed. What now?**
-
-A: The app falls back to a curated list of common modes. You can still use them, but detection helps prevent selecting an unsupported mode.
-
-**Q: Where do the processed files go?**
-
-A: Jobs are stored in the `jobs/` directory relative to where you run the server. They are automatically cleaned up after 2 hours.
+```sh
+id=$(curl -s -F video=@clip.mp4 localhost:9595/api/upload | jq -r .id)
+curl -s -X POST -d '{"mode":"lighten"}' localhost:9595/api/generate/$id
+curl -s localhost:9595/api/job/$id
+curl -s -o out.mp4 "localhost:9595/api/result/$id?download=1"
+```
 
 ## License
 
-MIT License. See the [LICENSE](LICENSE) file for details.
+Released under the [MIT License](LICENSE).
+
+---
+
+(c) petroffspace.com
